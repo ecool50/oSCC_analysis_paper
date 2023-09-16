@@ -1,0 +1,675 @@
+---
+title: "oSCC Analysis"
+author: "Elijah Willie"
+date: "2023-06-27"
+output: html_document
+---
+
+```{r}
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(FuseSOM)
+  library(spicyR)
+  library(lisaClust)
+  library(scater)
+  library(ClassifyR)
+  library(scFeatures)
+  library(lme4)
+  library(lmerTest)
+  library(cytomapper)
+  library(SKM)
+  library(cvAUC)
+  library(dplyr)
+  library(tidyverse)
+  library(ggsci)
+  library(caret)
+  library(e1071)
+  source('~/Documents/PhD/oSCC_Analysis/scripts/CustomCV.R')
+})
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = T) 
+# knitr::opts_chunk$set(fig.width=10, fig.height=6) 
+```
+
+```{r}
+nCores <- 4
+BPPARAM <- simpleSeg:::generateBPParam(nCores)
+theme_set(theme_classic())
+```
+
+# load the normalized data, images and metadata
+```{r}
+load("../Data/oSCC_cells_normalised.RData")
+```
+
+## Perform the clustering using FuseSOM
+```{r}
+set.seed(1994)
+markers <- markers[!markers%in%c("HH3", "DNA1", "DNA2")]
+
+useMarkers <- c("CD20", #B cells
+                "CD31",  #Endothelial cells
+                "podoplanin", #Epothelial cells
+                "CD66a", # Granulocytes
+                "FX111A",  # Macrophages
+                "CD14", # Monocytes
+                "CD3", "CD4", "CD8a", # T cells
+                "CD56", # NK cell
+                "CD11c", # Dendritic cells
+                # "MPO", # Neutrophils
+                "CD45", # Immune
+                "panCK","p40", # Tumour
+                'FoxP3')
+                
+secMarkers <- c('CD68', 'HLADR', 'MPO', 'CD103', 'CD16', 'Tbet', 'CD197', 
+                'CD45RA', 'CD45RO', 'DC-SIGN', 'CADM1', 'PD1')
+# Generate SOM and cluster cells into 20 groups.
+cells <- runFuseSOM(cells,
+                    markers = useMarkers,
+                    assay = 'norm',
+                    numClusters = 13)
+```
+
+# Check how many clusters should be used.
+We can check to see how reasonable our choice of 20 clusters is using the `estimateNumCluster` and the `optiPlot` functions. Here we examine the Gap method, others such as Silhouette and Within Cluster Distance are also available.
+```{r, eval=FALSE}
+# Generate metrics for estimating the number of clusters.
+# As I've already run runFuseSOM I don't need to run generateSOM().
+cells <- estimateNumCluster(cells, kSeq = 2:30)
+
+# 'jump', 'slope', 'wcd', 'gap', 'silhouette'
+optiPlot(cells, method = "silhouette")
+```
+
+# Generat heatmaps of the initial clustering
+```{r}
+# Visualise marker expression in each cluster.
+scater::plotGroupedHeatmap(cells, 
+                           features = useMarkers, 
+                           group = "clusters", 
+                           block = "clusters",
+                           exprs_values = "norm",
+                           center = TRUE, 
+                           scale = TRUE, 
+                           zlim = c(-3,3),
+                           cluster_rows = FALSE)
+```
+## Annotate the clustering based on marker expression
+```{r}
+colData(cells)$clusters_13 <- dplyr::recode(colData(cells)$clusters,
+                                         'cluster_1' = 'Squamous Cell 1',
+                                         'cluster_2' = 'Squamous Cell 2',
+                                         'cluster_3' = 'CD8+ T cell',
+                                         'cluster_4' = 'B cell',
+                                         'cluster_5' = 'CD4+ Treg',
+                                         'cluster_6' = 'Squamous Cell 3',
+                                         'cluster_7' = 'Endothelial cell',
+                                         'cluster_8' = 'Granulocyte',
+                                         'cluster_9' = 'Neutrophil',
+                                         'cluster_10' = 'Mo-Derived DC',
+                                         'cluster_11' = 'Squamous Cell 4',
+                                         'cluster_12' = 'Fibroblast',
+                                         'cluster_13' = 'Stromal Fibroblast')
+```
+
+## Visualize annotation
+```{r}
+# pdf(file = "Plots/key_markers.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+
+# Visualise marker expression in each cluster.
+scater::plotGroupedHeatmap(cells, 
+                           features = useMarkers, 
+                           group = "clusters_13", 
+                           block = "clusters_13",
+                           exprs_values = "norm",
+                           center = TRUE, 
+                           scale = TRUE, 
+                           zlim = c(-3,3),
+                           cluster_rows = FALSE)
+# dev.off()
+```
+## Visualize all markers
+```{r,fig.height=6, fig.width=8}
+# pdf(file = "Plots/All_markers.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 10) # The height of the plot in inches
+
+# Visualise marker expression in each cluster.
+scater::plotGroupedHeatmap(cells, 
+                           features = markers, 
+                           group = "clusters_13", 
+                           block = "clusters_13",
+                           exprs_values = "norm",
+                           center = TRUE, 
+                           scale = TRUE, 
+                           zlim = c(-3,3),
+                           cluster_rows = FALSE)
+# dev.off()
+```
+
+# Test For association between the proportion of each cell type and progression status
+The `colTest` function allows us to quickly test for associations between the proportions of the cell types and progression status using either wilcoxon rank sum tests or t-tests. Here we see a p-value less than 0.05 but this does not equate to a small fdr.
+
+```{r}
+testProp <- colTest(cells, 
+                      feature = "clusters_13",
+                      condition = "Responder", type = 'wilcox')
+testProp 
+```
+
+# Perform dimension reduction using UMAP
+```{r, fig.height=6, fig.width=8}
+set.seed(51773)
+cells <- scater::runUMAP(cells,
+                         subset_row = useMarkers,
+                         exprs_values = "norm",
+                         BPPARAM = BPPARAM, 
+                         n_threads = 7, 
+                         n_neighbors = 15,
+                         metric = 'cosine',
+                         verbose = TRUE)
+
+df_umap <- reducedDim(cells, 'UMAP') %>%
+    as.data.frame()
+colnames(df_umap) <- c('UMAP 1', 'UMAP 2')
+
+df_umap$`Cell Type` <- cells$clusters_13
+
+
+# pdf(file = "Plots/Umap_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+
+df_umap %>% ggplot(aes(`UMAP 1`, `UMAP 2`)) +
+    geom_point(aes(color = `Cell Type`), size = 2) + 
+    ggtitle('Umap plot of cells') +
+  theme_bw() +
+    theme(axis.text.x = element_text(size = 12),
+        plot.title = element_text(size = 15, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12)
+        ) + scale_color_d3(palette = 'category20') +
+  guides(colour = guide_legend(override.aes = list(size=6)))
+
+# dev.off()
+```
+
+# use SpicyR to test for changes in pairwise spatial relationships between cell types.
+```{r}
+spicyTest <- spicy(cells, 
+                   condition = "Responder", 
+                   cellType = "clusters_13",
+                   imageID = "imageID",
+                   subject = "sampleID",
+                   spatialCoords = c("m.cx", "m.cy"),
+                   Rs = c(20, 50, 100),
+                   sigma = 50,
+                   BPPARAM = BPPARAM,
+                   weights = TRUE)
+topPairs(spicyTest, n = 10) 
+```
+
+## Generate the SpicyR plot
+```{r,fig.height=4, fig.width=6}
+# pdf(file = "Plots/SpicyR_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+# # Visualise which relationships are changing the most.
+p <- signifPlot(spicyTest,
+           breaks = c(-1.5, 2, 0.5))
+p$layers[[6]]$data$condition <- c('NR', 'R')
+shape.legend = c(NR = "\u25D6", R = "\u25D7")
+p + scale_shape_manual(values = shape.legend)
+
+# dev.off()
+```
+
+# Use lisaClust to Cluster cells into spatial regions with similar composition.
+```{r}
+set.seed(51773)
+cells <- lisaClust(cells, 
+                   k = 5, 
+                   Rs = c(20, 50, 100),
+                   sigma = 50,
+                   spatialCoords = c("m.cx", "m.cy"), 
+                   cellType = "clusters_13",
+                   BPPARAM = BPPARAM)
+```
+
+## Visualize a sample image with the regions
+```{r, fig.height=6, fig.width=8}
+# Extract cell information and filter to specific image.
+df <- colData(cells) |>
+as.data.frame() |>
+dplyr::filter(imageID == unique(imageID)[4])
+# Colour cells by their region.
+ggplot(df, aes(x = m.cx, y = m.cy, colour = region)) +
+  geom_point() + ggtitle('Localisation across a single image') + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## Use hatching to visualise regions and cell types.
+```{r, fig.height=6, fig.width=8}
+# pdf(file = "Plots/Hatching_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+hatchingPlot(cells,
+             useImages = unique(cells$imageID)[4],
+             cellType = "clusters_13",
+             spatialCoords = c("m.cx", "m.cy"),
+             window = "concave",
+             nbp = 300,
+             line.spacing = 41) + 
+  
+  scale_region_manual(values = c(region_1 = 1,
+                               region_2 = 2,
+                               region_3 = 3,
+                               region_4 = 4,
+                               region_5 = 5)) + 
+  
+   guides(colour = guide_legend(ncol = 2))
+
+# dev.off()
+```
+## Test for association with responding
+```{r}
+testRegion <- colTest(cells, 
+                      feature = "region",
+                      condition = "Responder",
+                      type = 'ttest')
+testRegion %>%
+  knitr::kable()
+```
+
+## Plot boxplots of responder proprotions in each region
+```{r,fig.height=5, fig.width=8}
+x <- unique(cells$imageID)
+cellPropRegion <- getProp(cells,
+                    feature = "region", imageID = "imageID", logit = F)
+
+cellPropRegion$Responder <- clinicalData[match(x,clinicalData$sampleID), "Responder"]
+
+cellPropRegionMelted <- data.table::melt(cellPropRegion)
+
+colnames(cellPropRegionMelted) <- c('Responder', 'Region', 'Proportion')
+
+cellPropRegionMelted <- cellPropRegionMelted %>%
+    na.omit()
+
+
+cellPropRegionMelted$Region <- dplyr::recode(cellPropRegionMelted$Region,
+                                            'region_1' = 'Region 1',
+                                            'region_2' = 'Region 2',
+                                            'region_3' = 'Region 3',
+                                            'region_4' = 'Region 4',
+                                            'region_5' = 'Region 5')
+
+cellPropRegionMelted$Responder <- dplyr::recode(cellPropRegionMelted$Responder,
+                                                'Y' = 'R',
+                                                'N' = 'NR'
+)
+
+# pdf(file = "Plots/Region_proportion_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 5) # The height of the plot in inches
+
+cellPropRegionMelted %>% ggplot(aes(Responder, Proportion)) +
+    geom_boxplot(aes(fill = Responder)) + 
+    geom_jitter() +
+    facet_grid(~Region) +
+    ggtitle('Boxplot of region proportions for responder and non-responder') +
+    theme(axis.text.x = element_text(size = 15),
+        plot.title = element_text(size = 12, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        strip.text.x = element_text(size = 12),
+        legend.title = element_text(size = 12)
+        ) + scale_fill_jama()
+
+# dev.off()
+```
+## Region - cell type enrichment heatmap
+```{r, fig.height=4, fig.width=6}
+# pdf(file = "Plots/Region_map_plot.pdf",   # The directory you want to save the file in
+#     width = 6, # The width of the plot in inches
+#     height = 4) # The height of the plot in inches
+
+# Visualise the enrichment of each cell type in each region
+regionMap(cells, cellType = "clusters_13", limit = c(0.2, 5))
+# dev.off()
+```
+# Test for difference between cell means for cell type and region
+```{r}
+responderDf <- colData(cells) %>%
+  as.data.frame()
+
+markerDf = 
+  responderDf |> 
+  select(imageID, sampleID, clusters_13, region) |> 
+  cbind(data.frame(t(assay(cells, "norm")))) |>
+  select(imageID, sampleID, clusters_13, region, useMarkers)
+
+# Mean marker per cell type
+markerMeanCellType = markerDf |> 
+  select(-c(sampleID, region)) |> 
+  group_by(imageID, clusters_13) |> 
+  summarise_at(vars(-group_cols()), mean, na.rm = TRUE) |> 
+  pivot_longer(-c(imageID, clusters_13), names_to = "markers") |> 
+  pivot_wider(names_from = c(clusters_13, markers), values_from = value) |> 
+  column_to_rownames("imageID") %>% 
+  replace(is.na(.), 0)
+
+
+# Mean marker per region
+markerMeanRegion = markerDf |> 
+  select(-c(sampleID, clusters_13)) |> 
+  group_by(imageID, region) |> 
+  summarise_at(vars(-group_cols()), mean, na.rm = TRUE) |> 
+  pivot_longer(-c(imageID, region), names_to = "markers") |> 
+  pivot_wider(names_from = c(region, markers), values_from = value) |> 
+  column_to_rownames("imageID") %>% 
+  replace(is.na(.), 0)
+  
+
+# Mean marker per cell type per region
+markerMeanCellTypeRegion = markerDf |> 
+  select(-c(sampleID)) |> 
+  group_by(imageID, clusters_13, region) |> 
+  summarise_at(vars(-group_cols()), mean, na.rm = TRUE) |> 
+  pivot_longer(-c(imageID, clusters_13, region), names_to = "markers") |> 
+  pivot_wider(names_from = c(clusters_13, region, markers), values_from = value) |> 
+  column_to_rownames("imageID") %>% 
+  replace(is.na(.), 0)
+```
+
+## Test marker cell type means
+```{r}
+testMarkerMeanCellType <- colTest(markerMeanCellType,
+                condition = clinicalData[rownames(markerMeanCellType), ]$Responder)
+testMarkerMeanCellType |> 
+    head(10)
+```
+
+## Test marker mean per region
+```{r}
+testmarkerMeanRegion <- colTest(markerMeanRegion,
+                condition = clinicalData[rownames(markerMeanRegion), ]$Responder)
+testmarkerMeanRegion |> 
+    head(10) %>%
+  knitr::kable()
+```
+## Test marker mean per cell type per region
+```{r}
+testmarkerMeanCellTypeRegion <- colTest(markerMeanCellTypeRegion,
+                condition = clinicalData[rownames(markerMeanCellTypeRegion), ]$Responder)
+testmarkerMeanCellTypeRegion |> 
+    head(10) %>%
+  knitr::kable()
+```
+
+# Predictive modelling using Support Vector Machines (SVM) on the marker means per cell types
+## Set up the data - use all data for training
+```{r}
+row_names <- rownames(markerMeanCellType)
+colnames(markerMeanCellType) <- janitor::make_clean_names(colnames(markerMeanCellType))
+
+data_final <- markerMeanCellType
+colnames(data_final) <- janitor::make_clean_names(colnames(data_final))
+
+data_final$response <- factor(clinicalData[match(row_names,clinicalData$sampleID), 
+                                           "Responder"])
+data_final <- na.omit(data_final)
+
+n <- ncol(data_final)
+train_x <- data_final[, 1:n-1] %>%
+  as.matrix()
+train_y <- data_final$response
+```
+
+## Run 5-fold cross validation with 20 repeats (CV AUC = 0.85)
+```{r, eval=FALSE}
+cv_dat_svm <- KFoldCustom(train_x = train_x, train_y = train_y, nRepeats = 20,
+                      method = 'svm')
+```
+## Plot the CV ROC curve for all features
+```{r, fig.height=6, fig.width=9}
+# pdf(file = "Plots/SVM_all_features_CV_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+
+cv_dat <- cv_dat_svm[[2]]
+out <- cvAUC(cv_dat$predictions, cv_dat$labels)
+
+plot(out$perf, col = "black", lty = 3, size = 2,
+     main = paste0("Key features 5-fold CV with 20 repeats. Average AUC = ",
+                                                      round(out$cvAUC, 2)))
+plot(out$perf, col ="red", avg = "threshold", add = TRUE)
+
+# dev.off()
+```
+
+## Fit SVM model and predict on the training data
+```{r}
+model_svm <- support_vector_machine(
+  as.matrix(train_x),
+  factor(train_y),
+  kernel = "linear",
+  verbose = F,
+  seed = 1994
+)
+
+predictions <- predict(model_svm, as.matrix(train_x))
+```
+
+## Generate ROC curve from predictions (Perfect prediction on training data)
+```{r, fig.height=6, fig.width=8}
+roc.pred.test <- ROCR::prediction(predictions$probabilities[, 2], 
+                                  train_y)
+perf <- ROCR::performance(roc.pred.test, "tpr", "fpr")
+  
+  
+plt_dat = data.frame(
+    FPR = perf@x.values[[1]],
+    TPR = perf@y.values[[1]]
+  )
+  
+auc_perf <- ROCR::performance(roc.pred.test, measure = "auc")
+auc <- auc_perf@y.values[[1]]
+  
+ggplot(plt_dat, aes(x = FPR, y = TPR)) +
+    geom_line(colour = "blue") +
+    labs(x = perf@x.name, y = perf@y.name) +
+    geom_abline(slope = 1, intercept = 0) + theme_bw() + 
+    theme(
+      plot.title = element_text(color="Black", size=16, face="bold", hjust = 0.5),
+      plot.subtitle = element_text(color = "red", size = 16, hjust = 0.5),
+      axis.title.x = element_text(color="Black", size=16),
+      axis.title.y = element_text(color="Black", size=16),
+      axis.text.y = element_text(size = 16),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 16),
+      strip.text.x = element_text(size = 16),
+      legend.title = element_text(size=16), #change legend title font size
+      legend.text = element_text(size=16) #change legend text font size)
+    )  + ggtitle(paste("All featuers AUC =", round(auc, digits = 2)))
+```
+
+## Now look at a subset of key 13 features for the SVM model
+Again, use all the data for training
+```{r}
+data_final <- markerMeanCellType %>%
+  dplyr::select(squamous_cell_3_pan_ck, cd8_t_cell_cd3, cd4_treg_cd20, neutrophil_cd45,
+         fibroblast_cd56, neutrophil_cd31, neutrophil_podoplanin, neutrophil_cd66a,
+         neutrophil_cd4, cd4_treg_cd56, neutrophil_cd11c, stromal_fibroblast_fx111a,
+         cd4_treg_cd3)
+
+data_final$response <- factor(clinicalData[match(x,clinicalData$sampleID), 
+                                           "Responder"])
+data_final <- na.omit(data_final)
+
+n <- ncol(data_final)
+train_x <- data_final[, 1:n-1] %>%
+  as.matrix()
+train_y <- data_final$response
+```
+
+## Run 5-fold cross validation with 20 repeats (CV AUC = 0.83)
+```{r, eval=FALSE}
+cv_dat_svm <- KFoldCustom(train_x = train_x, train_y = train_y, nRepeats = 20,
+                      method = 'svm')
+```
+## Plot the CV ROC curve for key features
+```{r, fig.height=6, fig.width=9}
+# pdf(file = "Plots/SVM_key_features_CV_plot.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+
+cv_dat <- cv_dat_svm[[2]]
+out <- cvAUC(cv_dat$predictions, cv_dat$labels)
+
+plot(out$perf, col = "black", lty = 3, size = 2,
+     main = paste0("Key features 5-fold CV with 20 repeats. Average AUC = ",
+                                                      round(out$cvAUC, 2)))
+plot(out$perf, col ="red", avg = "threshold", add = TRUE)
+
+# dev.off()
+```
+
+## Fit SVM model and predict on the training data
+```{r}
+model_svm <- support_vector_machine(
+  as.matrix(train_x),
+  factor(train_y),
+  kernel = "linear",
+  verbose = F,
+  seed = 1994
+)
+
+predictions <- predict(model_svm, as.matrix(train_x))
+```
+
+## Generate ROC curve from predictions (Perfect prediction on training data)
+```{r, fig.height=6, fig.width=8}
+roc.pred.test <- ROCR::prediction(predictions$probabilities[, 2], 
+                                  train_y)
+perf <- ROCR::performance(roc.pred.test, "tpr", "fpr")
+  
+  
+plt_dat = data.frame(
+    FPR = perf@x.values[[1]],
+    TPR = perf@y.values[[1]]
+  )
+  
+auc_perf <- ROCR::performance(roc.pred.test, measure = "auc")
+auc <- auc_perf@y.values[[1]]
+  
+ggplot(plt_dat, aes(x = FPR, y = TPR)) +
+    geom_line(colour = "blue") +
+    labs(x = perf@x.name, y = perf@y.name) +
+    geom_abline(slope = 1, intercept = 0) + theme_bw() + 
+    theme(
+      plot.title = element_text(color="Black", size=16, face="bold", hjust = 0.5),
+      plot.subtitle = element_text(color = "red", size = 16, hjust = 0.5),
+      axis.title.x = element_text(color="Black", size=16),
+      axis.title.y = element_text(color="Black", size=16),
+      axis.text.y = element_text(size = 16),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 16),
+      strip.text.x = element_text(size = 16),
+      legend.title = element_text(size=16), #change legend title font size
+      legend.text = element_text(size=16) #change legend text font size)
+    )  + ggtitle(paste("Key features AUC =", round(auc, digits = 2)))
+```
+
+## Plot the weights from the SVM model
+```{r}
+sv <- model_svm[["fitted_model"]][["SV"]]
+coef <- model_svm[["fitted_model"]][["coefs"]]
+
+w = t(sv) %*% coef %>%
+  as.data.frame()
+b = -model_svm[["fitted_model"]][["rho"]]
+
+w$Feature <- rownames(w)
+colnames(w)[[1]] <- 'Weight'
+
+# pdf(file = "Plots/SVM_features.pdf",   # The directory you want to save the file in
+#     width = 8, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+w$Feature <- gsub('fox_p3', 'foxp3', w$Feature)
+w$Feature <- gsub('pan_ck', 'panck', w$Feature)
+w$Feature <- stri_replace_last(w$Feature, fixed = "_", ": ") 
+w$Feature <- gsub('_', ' ', w$Feature)
+
+ggplot(w, aes(x=reorder(Feature, Weight), y=Weight, fill=Weight))+
+   geom_bar(stat="identity") +
+  scale_fill_gradient2(low="darkblue", high="darkred") +
+        ggtitle("Plot of feature weights for SVM model")+
+        labs(x = "Feature",
+             y = "Weight") +
+        theme(axis.title = element_text(size = 15, face = "bold"),
+              axis.text = element_text(size = 15),
+              plot.title = element_text(size = 16, hjust = 0.5, face = "bold")) + 
+  coord_flip()
+
+# dev.off()
+```
+## Generate scatter plot of top two features colored by responder
+```{r, fig.height=6, fig.width=9}
+df_sub <- data_final %>% 
+    select(cd4_treg_cd3, neutrophil_cd45) %>%
+    as.data.frame()
+
+df_sub$Responder <- train_y
+# pdf(file = "Plots/Scatterplot_svm_top_2_features.pdf",   # The directory you want to save the file in
+#     width = 9, # The width of the plot in inches
+#     height = 6) # The height of the plot in inches
+
+df_sub %>% ggplot(aes(cd4_treg_cd3, neutrophil_cd45)) +
+    geom_point(aes(color = Responder), size = 3) +
+    scale_color_aaas() +
+    theme_bw() +
+    ylab('Neutrophil CD45') +
+    xlab('CD4 Treg CD3') +
+    ggtitle('Mean marker abundance for CD4 Treg: CD3 and Neutrophil CD45') +
+    theme(axis.text.x = element_text(size = 16),
+          plot.title = element_text(size = 18, hjust = 0.5),
+          axis.text.y = element_text(size = 16),
+          axis.title.y = element_text(size = 16),
+          axis.title.x = element_text(size = 16),
+          legend.text = element_text(size = 16),
+          legend.title = element_text(size = 16)
+    )
+
+# dev.off()
+
+```
+
+## Fit an SVM model on the top two features and plot decision boundary
+```{r,fig.height=8, fig.width=9}
+svmfit <- svm(Responder~., data = df_sub, kernel = "linear", scale = FALSE,
+              probability=TRUE)
+
+plot_svm_jk(df_sub,svmfit, ESL_theme = F) + ylab('Neutrophil CD45') +
+    xlab('CD4 Treg CD3') +
+    ggtitle('SVM plot of mean marker abundance for CD4 Treg: CD3 and Neutrophil CD45') +
+    theme(axis.text.x = element_text(size = 16),
+          plot.title = element_text(size = 18, hjust = 0.5),
+          axis.text.y = element_text(size = 16),
+          axis.title.y = element_text(size = 16),
+          axis.title.x = element_text(size = 16),
+          legend.text = element_text(size = 16),
+          legend.title = element_text(size = 16)
+    ) + scale_color_aaas()
+  
+```
